@@ -51,6 +51,9 @@ Tool calls are parsed three ways for broad model compatibility:
 
 ### Windows Installation
 
+📖 **For detailed Windows setup, see [WINDOWS_COMPATIBILITY.md](WINDOWS_COMPATIBILITY.md)**
+
+
 On Windows, install the optional `pyreadline3` package for command history support:
 
 ```powershell
