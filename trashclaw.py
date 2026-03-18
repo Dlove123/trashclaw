@@ -39,7 +39,7 @@ else:
     import readline
 
 # ── Config ──
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".trashclaw")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 HISTORY_FILE = os.path.join(CONFIG_DIR, "history")
@@ -493,21 +493,36 @@ def _auto_compact():
 
 def _load_project_instructions() -> str:
     """Load project-specific instructions from .trashclaw.md or CLAUDE.md in CWD."""
+    result = ""
     for name in (".trashclaw.md", "TRASHCLAW.md", "CLAUDE.md"):
         path = os.path.join(CWD, name)
         if os.path.exists(path):
             try:
                 with open(path, "r") as f:
-                    content = f.read(4000)  # Cap at 4K to not blow context
-                return f"\n\n--- Project Instructions (from {name}) ---\n{content}"
+                    content = f.read(4000)
+                result += f"\n\n--- Project Instructions (from {name}) ---\n{content}"
+                break
             except Exception:
                 pass
-    return ""
+
+    # Load project memory if it exists
+    mem_file = os.path.join(CWD, ".trashclaw", "memory.json")
+    if os.path.exists(mem_file):
+        try:
+            with open(mem_file, 'r') as f:
+                memories = json.load(f)
+            if memories:
+                result += "\n\n--- Project Memory ---\n"
+                result += "\n".join(f"- {m}" for m in memories[-20:])  # Last 20
+        except Exception:
+            pass
+
+    return result
 
 
-SLASH_COMMANDS = ["/about", "/achievements", "/cd", "/clear", "/compact",
-                  "/config", "/exit", "/export", "/help", "/load", "/model",
-                  "/plugins", "/quit", "/save", "/sessions", "/status", "/undo"]
+SLASH_COMMANDS = ["/about", "/achievements", "/add", "/cd", "/clear", "/compact",
+                  "/config", "/diff", "/exit", "/export", "/help", "/load", "/model",
+                  "/plugins", "/quit", "/remember", "/save", "/sessions", "/status", "/undo"]
 
 
 def _setup_tab_completion():
@@ -1653,6 +1668,115 @@ def handle_slash(cmd: str) -> bool:
                     except:
                         print(f"    - {name} (unreadable)")
 
+    elif command == "/diff":
+        # Show all file changes made this session (from undo stack)
+        if not UNDO_STACK:
+            print("  No file changes this session.")
+        else:
+            seen = set()
+            print(f"\n  \033[1mChanges this session\033[0m ({len(UNDO_STACK)} operations)\n")
+            for entry in UNDO_STACK:
+                path = entry["path"]
+                action = entry["action"]
+                if path not in seen:
+                    # Show current state vs original
+                    seen.add(path)
+                    existed = entry["content"] is not None
+                    now_exists = os.path.exists(path)
+                    if not existed and now_exists:
+                        print(f"  \033[32m+ {path}\033[0m (created)")
+                    elif existed and now_exists:
+                        try:
+                            with open(path, 'r') as f:
+                                current = f.read()
+                            original = entry["content"]
+                            if current != original:
+                                added = len(current.split('\n')) - len(original.split('\n'))
+                                sign = "+" if added >= 0 else ""
+                                print(f"  \033[33m~ {path}\033[0m ({sign}{added} lines)")
+                            else:
+                                print(f"  \033[90m  {path}\033[0m (reverted)")
+                        except Exception:
+                            print(f"  \033[33m~ {path}\033[0m (modified)")
+                    elif existed and not now_exists:
+                        print(f"  \033[31m- {path}\033[0m (deleted)")
+            print()
+
+    elif command == "/add":
+        # Pre-load files into conversation context
+        if not arg:
+            print("  Usage: /add file1.py [file2.py ...]")
+            print("  Pre-loads file contents into context so the agent can reference them.")
+        else:
+            files = arg.split()
+            loaded = 0
+            for f in files:
+                path = _resolve_path(f)
+                if os.path.isfile(path):
+                    try:
+                        with open(path, 'r') as fh:
+                            content = fh.read()
+                        if len(content) > MAX_OUTPUT_CHARS * 2:
+                            content = content[:MAX_OUTPUT_CHARS * 2] + f"\n... (truncated at {MAX_OUTPUT_CHARS * 2} chars)"
+                        HISTORY.append({
+                            "role": "user",
+                            "content": f"[Pre-loaded file: {path}]\n```\n{content}\n```"
+                        })
+                        lines = content.count('\n') + 1
+                        print(f"  \033[32m[loaded]\033[0m {path} ({lines} lines)")
+                        loaded += 1
+                    except Exception as e:
+                        print(f"  \033[31m[error]\033[0m {path}: {e}")
+                else:
+                    print(f"  \033[31m[not found]\033[0m {path}")
+            if loaded:
+                print(f"  {loaded} file{'s' if loaded != 1 else ''} added to context.")
+
+    elif command == "/remember":
+        # Project memory — store/recall facts about the current project
+        mem_dir = os.path.join(CWD, ".trashclaw")
+        mem_file = os.path.join(mem_dir, "memory.json")
+        if not arg:
+            # Show memories
+            if os.path.exists(mem_file):
+                try:
+                    with open(mem_file, 'r') as f:
+                        memories = json.load(f)
+                    if memories:
+                        print(f"\n  \033[1mProject Memory\033[0m ({len(memories)} items)\n")
+                        for i, mem in enumerate(memories, 1):
+                            print(f"  {i}. {mem}")
+                        print()
+                    else:
+                        print("  No project memories yet.")
+                except Exception:
+                    print("  Error reading memory file.")
+            else:
+                print("  No project memories yet. Use /remember <text> to save one.")
+        elif arg.startswith("clear"):
+            if os.path.exists(mem_file):
+                os.remove(mem_file)
+                print("  Project memory cleared.")
+            else:
+                print("  Nothing to clear.")
+        else:
+            # Save a memory
+            os.makedirs(mem_dir, exist_ok=True)
+            memories = []
+            if os.path.exists(mem_file):
+                try:
+                    with open(mem_file, 'r') as f:
+                        memories = json.load(f)
+                except Exception:
+                    pass
+            memories.append(arg)
+            try:
+                with open(mem_file, 'w') as f:
+                    json.dump(memories, f, indent=2)
+                print(f"  Remembered: {arg}")
+            except Exception as e:
+                print(f"  Error saving: {e}")
+
     elif command == "/plugins":
         if not os.path.isdir(PLUGINS_DIR):
             print(f"  No plugins directory. Create {PLUGINS_DIR}/ and add .py files.")
@@ -1820,14 +1944,20 @@ def handle_slash(cmd: str) -> bool:
   /cd <dir>      Change working directory
   /clear         Clear all conversation context
   /compact       Keep only last 10 messages
-  /status        Show server, model, and context info
+  /status        Server, model, context, git branch, stats
+  /add <files>   Pre-load files into agent context
+  /diff          Show all file changes this session
   /save <name>   Save conversation to session file
   /load <name>   Load conversation from session file
   /sessions      List saved sessions
-  /model <name>  Switch model mid-session (for Ollama/multi-model)
-  /export [name] Export conversation as markdown file
+  /model <name>  Switch model mid-session
+  /export [name] Export conversation as markdown
+  /remember <text>  Save a note to project memory (.trashclaw/memory.json)
   /undo          Undo last file write or edit
-  /config        Show config (or /config key value to set)
+  /config        Show/set persistent config
+  /plugins       Show loaded plugins
+  /achievements  Show progress and stats
+  /about         The manifesto
   /exit          Exit TrashClaw
   /help          Show this help
 
@@ -1837,6 +1967,7 @@ def handle_slash(cmd: str) -> bool:
   --auto-shell   Skip shell command approval
   -e, --exec "prompt"  Run one prompt and exit (non-interactive)
   --system "text" Inject custom instructions into system prompt
+  --watch "*.py" "run tests"  Watch files, run prompt on change
   --version      Show version
 
   \033[1mEnvironment Variables\033[0m
@@ -1887,6 +2018,51 @@ def banner():
     print(f"    Type /help for commands, /about for the manifesto.\n")
 
 
+def _watch_mode(pattern: str, prompt: str):
+    """Watch files matching pattern, run prompt when they change."""
+    import fnmatch
+
+    print(f"  \033[36m[watch]\033[0m Watching '{pattern}' in {CWD}")
+    print(f"  \033[36m[watch]\033[0m On change: \"{prompt}\"")
+    print(f"  \033[90mCtrl+C to stop\033[0m\n")
+
+    def _get_mtimes():
+        mtimes = {}
+        for root, dirs, files in os.walk(CWD):
+            # Skip hidden dirs and common noise
+            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('node_modules', '__pycache__', 'venv', '.git')]
+            for f in files:
+                if fnmatch.fnmatch(f, pattern):
+                    path = os.path.join(root, f)
+                    try:
+                        mtimes[path] = os.path.getmtime(path)
+                    except OSError:
+                        pass
+        return mtimes
+
+    prev = _get_mtimes()
+    try:
+        while True:
+            time.sleep(2)
+            current = _get_mtimes()
+            changed = []
+            for path, mtime in current.items():
+                if path not in prev or prev[path] != mtime:
+                    changed.append(os.path.relpath(path, CWD))
+            if changed:
+                change_list = ", ".join(changed[:5])
+                if len(changed) > 5:
+                    change_list += f" (+{len(changed) - 5} more)"
+                print(f"\n  \033[33m[changed]\033[0m {change_list}")
+                full_prompt = f"Files changed: {change_list}\n\n{prompt}"
+                agent_turn(full_prompt)
+                prev = _get_mtimes()  # Reset after handling
+            else:
+                prev = current
+    except KeyboardInterrupt:
+        print("\n  \033[36m[watch]\033[0m Stopped.")
+
+
 def main():
     global CWD
 
@@ -1909,6 +2085,8 @@ def main():
             one_shot = args[i + 1]; i += 2
         elif args[i] == "--system" and i + 1 < len(args):
             globals()["EXTRA_SYSTEM_PROMPT"] = args[i + 1]; i += 2
+        elif args[i] == "--watch" and i + 2 < len(args):
+            _watch_mode(args[i + 1], args[i + 2]); sys.exit(0)
         elif args[i] == "--version":
             print(f"TrashClaw v{VERSION}"); sys.exit(0)
         else:
