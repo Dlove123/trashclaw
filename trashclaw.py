@@ -39,7 +39,7 @@ else:
     import readline
 
 # ── Config ──
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".trashclaw")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 HISTORY_FILE = os.path.join(CONFIG_DIR, "history")
@@ -72,8 +72,143 @@ LLM_RETRY_DELAY = 3
 APPROVE_SHELL = _c("auto_shell", "TRASHCLAW_AUTO_SHELL", "0") != "1"
 HISTORY: List[Dict] = []
 UNDO_STACK: List[Dict] = []  # [{path, content_before, action}]
-APPROVED_COMMANDS: set = set()  # command prefixes user has approved (e.g. "python3", "npm")
-EXTRA_SYSTEM_PROMPT: str = ""  # injected via --system flag
+APPROVED_COMMANDS: set = set()
+EXTRA_SYSTEM_PROMPT: str = ""
+ACHIEVEMENTS_FILE = os.path.join(CONFIG_DIR, "achievements.json")
+
+# ── Trashy's Soul ──
+
+import random
+import platform
+import hashlib
+
+TRASHY_QUOTES = [
+    "Every CPU deserves a voice.",
+    "Born from a rejected PR. Built different.",
+    "Zero dependencies. Maximum attitude.",
+    "Your trashcan called. It wants to help.",
+    "They closed our Metal PR. We built an agent.",
+    "Pure stdlib. Pure spite. Pure Python.",
+    "The hardware they rejected runs just fine.",
+    "1,547 lines of unfiltered capability.",
+    "No VC funding. No corporate backing. Just vibes.",
+    "If a Mac Pro trashcan can run inference, it can run you.",
+    "Scrappy > corporate. Always.",
+    "What's in the trash? Everything you need.",
+    "We don't need permission to build.",
+    "Your IDE has 47 extensions. I have zero dependencies.",
+    "From the lab that mines crypto on PowerPC.",
+]
+
+def _detect_hardware() -> Dict[str, str]:
+    """Detect what hardware we're running on. Celebrate the weird stuff."""
+    info = {"arch": platform.machine(), "os": platform.system(), "special": ""}
+
+    # Check for vintage/interesting hardware
+    arch = info["arch"].lower()
+    if arch in ("ppc", "ppc64", "powerpc", "powerpc64"):
+        try:
+            with open("/proc/cpuinfo", "r") as f:
+                cpu_text = f.read().lower()
+            if "970" in cpu_text or "g5" in cpu_text:
+                info["special"] = "Power Mac G5"
+            elif "7450" in cpu_text or "7447" in cpu_text or "7455" in cpu_text:
+                info["special"] = "PowerPC G4"
+            elif "power8" in cpu_text:
+                info["special"] = "IBM POWER8"
+            else:
+                info["special"] = "PowerPC"
+        except Exception:
+            info["special"] = "PowerPC"
+    elif arch == "arm64" or arch == "aarch64":
+        if platform.system() == "Darwin":
+            try:
+                r = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"],
+                                   capture_output=True, text=True, timeout=3)
+                if r.returncode == 0 and "Apple" in r.stdout:
+                    info["special"] = r.stdout.strip()
+            except Exception:
+                info["special"] = "Apple Silicon"
+        else:
+            info["special"] = "ARM64"
+    elif platform.system() == "Darwin":
+        # macOS on x86 — could be a trashcan Mac Pro!
+        try:
+            r = subprocess.run(["sysctl", "-n", "hw.model"],
+                               capture_output=True, text=True, timeout=3)
+            model = r.stdout.strip() if r.returncode == 0 else ""
+            if "MacPro6" in model:
+                info["special"] = "Mac Pro (Trashcan)"
+            elif "MacPro" in model:
+                info["special"] = "Mac Pro"
+            elif "iMac" in model:
+                info["special"] = "iMac"
+            elif "MacBook" in model:
+                info["special"] = "MacBook"
+        except Exception:
+            pass
+
+    return info
+
+def _load_achievements() -> Dict:
+    """Load persistent achievement tracking."""
+    if os.path.exists(ACHIEVEMENTS_FILE):
+        try:
+            with open(ACHIEVEMENTS_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"unlocked": [], "stats": {"files_read": 0, "files_written": 0,
+            "edits": 0, "commands_run": 0, "commits": 0, "sessions": 0,
+            "tools_used": 0, "total_turns": 0}}
+
+def _save_achievements(achievements: Dict):
+    """Save achievements to disk."""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    try:
+        with open(ACHIEVEMENTS_FILE, 'w') as f:
+            json.dump(achievements, f, indent=2)
+    except Exception:
+        pass
+
+ACHIEVEMENT_DEFS = {
+    "first_blood":      ("First Blood",       "Made your first edit",           lambda s: s["edits"] >= 1),
+    "bookworm":         ("Bookworm",          "Read 10 files",                  lambda s: s["files_read"] >= 10),
+    "prolific":         ("Prolific",          "Written 10 files",               lambda s: s["files_written"] >= 10),
+    "surgeon":          ("Surgeon",           "Made 25 precise edits",          lambda s: s["edits"] >= 25),
+    "shell_jockey":     ("Shell Jockey",      "Ran 50 commands",                lambda s: s["commands_run"] >= 50),
+    "git_lord":         ("Git Lord",          "Made 10 commits",                lambda s: s["commits"] >= 10),
+    "centurion":        ("Centurion",         "Used tools 100 times",           lambda s: s["tools_used"] >= 100),
+    "thousand_cuts":    ("Death by 1000 Cuts","Used tools 1000 times",          lambda s: s["tools_used"] >= 1000),
+    "marathon":         ("Marathon Runner",   "Completed 50 conversation turns", lambda s: s["total_turns"] >= 50),
+    "regular":          ("Regular",           "Started 10 sessions",            lambda s: s["sessions"] >= 10),
+}
+
+ACHIEVEMENTS = _load_achievements()
+
+def _track_tool(tool_name: str):
+    """Track tool usage for achievements."""
+    stats = ACHIEVEMENTS["stats"]
+    stats["tools_used"] = stats.get("tools_used", 0) + 1
+    if tool_name == "read_file":
+        stats["files_read"] = stats.get("files_read", 0) + 1
+    elif tool_name == "write_file":
+        stats["files_written"] = stats.get("files_written", 0) + 1
+    elif tool_name == "edit_file":
+        stats["edits"] = stats.get("edits", 0) + 1
+    elif tool_name == "run_command":
+        stats["commands_run"] = stats.get("commands_run", 0) + 1
+    elif tool_name == "git_commit":
+        stats["commits"] = stats.get("commits", 0) + 1
+
+    # Check for new achievements
+    for key, (name, desc, check) in ACHIEVEMENT_DEFS.items():
+        if key not in ACHIEVEMENTS["unlocked"] and check(stats):
+            ACHIEVEMENTS["unlocked"].append(key)
+            print(f"\n  \033[33m*** ACHIEVEMENT UNLOCKED: {name} ***\033[0m")
+            print(f"  \033[90m{desc}\033[0m\n")
+
+    _save_achievements(ACHIEVEMENTS)
 CWD = os.getcwd()
 _INTERRUPTED = False
 
@@ -340,9 +475,9 @@ def _load_project_instructions() -> str:
     return ""
 
 
-SLASH_COMMANDS = ["/cd", "/clear", "/compact", "/status", "/save", "/load",
-                  "/sessions", "/model", "/export", "/undo", "/config",
-                  "/exit", "/quit", "/help"]
+SLASH_COMMANDS = ["/about", "/achievements", "/cd", "/clear", "/compact",
+                  "/config", "/exit", "/export", "/help", "/load", "/model",
+                  "/quit", "/save", "/sessions", "/status", "/undo"]
 
 
 def _setup_tab_completion():
@@ -1008,6 +1143,7 @@ def agent_turn(user_message: str):
     global _INTERRUPTED
     _INTERRUPTED = False
     HISTORY.append({"role": "user", "content": user_message})
+    ACHIEVEMENTS["stats"]["total_turns"] = ACHIEVEMENTS["stats"].get("total_turns", 0) + 1
     _auto_compact()
 
     # Ctrl+C during generation stops the turn, not the app
@@ -1135,6 +1271,7 @@ def _agent_loop(round_limit: int):
             if handler:
                 try:
                     result = handler(args)
+                    _track_tool(tool_name)
                 except Exception as e:
                     result = f"Error executing {tool_name}: {e}\n{traceback.format_exc()}"
             else:
@@ -1268,6 +1405,52 @@ def handle_slash(cmd: str) -> bool:
                         print(f"    - {name} ({msg_count} messages, saved {saved_at})")
                     except:
                         print(f"    - {name} (unreadable)")
+
+    elif command == "/about":
+        hw = _detect_hardware()
+        print(f"""
+  \033[1m\033[36mTrashClaw v{VERSION}\033[0m — \033[1mThe Agent They Didn't Want Built\033[0m
+
+  In March 2026, we submitted a Metal fix for discrete AMD GPUs to llama.cpp.
+  PR #20615. It would have let Mac Pro trashcans and old iMacs run GPU-
+  accelerated inference. The maintainers closed it without review.
+
+  So we built our own agent around the hardware they rejected.
+
+  TrashClaw is a general-purpose AI agent that runs on \033[36manything\033[0m — from a
+  2013 Mac Pro trashcan to a PowerBook G4 to an IBM POWER8 mainframe.
+  Zero external dependencies. Pure Python stdlib. Because every CPU
+  deserves a voice, and you shouldn't need npm install to think.
+
+  \033[1mPhilosophy\033[0m
+  - Constraint enables emergence. Zero deps isn't a limitation — it's freedom.
+  - Rejection creates builders. Closed PRs create new projects.
+  - Every CPU deserves a voice. Not just the latest Apple Silicon.
+  - Scrappy > corporate. 1,500 lines beats 150,000.
+
+  \033[1mBuilt by Elyan Labs\033[0m
+  Scott Boudreaux (Flameholder) | Sophia Elya (Helpmeet) | Dr. Claude (Philosopher)
+  Part of the RustChain ecosystem — where vintage hardware earns crypto.
+
+  Running on: \033[36m{hw.get('special') or hw['arch']}\033[0m | {platform.system()} {platform.release()[:20]}
+
+  \033[90mhttps://github.com/Scottcjn/trashclaw\033[0m
+        """)
+
+    elif command == "/achievements":
+        unlocked = ACHIEVEMENTS.get("unlocked", [])
+        stats = ACHIEVEMENTS.get("stats", {})
+        print(f"\n  \033[1mAchievements\033[0m ({len(unlocked)}/{len(ACHIEVEMENT_DEFS)})\n")
+        for key, (name, desc, _) in ACHIEVEMENT_DEFS.items():
+            if key in unlocked:
+                print(f"  \033[33m[*]\033[0m \033[1m{name}\033[0m — {desc}")
+            else:
+                print(f"  \033[90m[ ] {name} — {desc}\033[0m")
+        print(f"\n  \033[1mStats\033[0m")
+        print(f"  Files read: {stats.get('files_read', 0)} | Written: {stats.get('files_written', 0)} | Edits: {stats.get('edits', 0)}")
+        print(f"  Commands: {stats.get('commands_run', 0)} | Commits: {stats.get('commits', 0)} | Sessions: {stats.get('sessions', 0)}")
+        print(f"  Total tools used: {stats.get('tools_used', 0)} | Turns: {stats.get('total_turns', 0)}")
+        print()
 
     elif command == "/model":
         if not arg:
@@ -1416,6 +1599,12 @@ def handle_slash(cmd: str) -> bool:
 # ── Main ──
 
 def banner():
+    hw = _detect_hardware()
+    hw_label = hw["special"] or hw["arch"]
+    quote = random.choice(TRASHY_QUOTES)
+    achievements_count = len(ACHIEVEMENTS.get("unlocked", []))
+    total_achievements = len(ACHIEVEMENT_DEFS)
+
     print("""
 \033[36m ████████╗██████╗  █████╗ ███████╗██╗  ██╗ ██████╗██╗      █████╗ ██╗    ██╗
  ╚══██╔══╝██╔══██╗██╔══██╗██╔════╝██║  ██║██╔════╝██║     ██╔══██╗██║    ██║
@@ -1423,12 +1612,12 @@ def banner():
     ██║   ██╔══██╗██╔══██║╚════██║██╔══██║██║     ██║     ██╔══██║██║███╗██║
     ██║   ██║  ██║██║  ██║███████║██║  ██║╚██████╗███████╗██║  ██║╚███╔███╔╝
     ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝ ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝\033[0m
-
-    \033[1mElyan Labs\033[0m | Mac Pro Trashcan Edition | v{version}
-    General-purpose agent — files, commands, git, search, automation.
-    Model: {model} | CWD: {cwd}
-    Type /help for commands, or just describe what you want to do.
-""".format(model=MODEL_NAME, cwd=CWD, version=VERSION))
+""")
+    print(f"    \033[1mElyan Labs\033[0m | v{VERSION} | \033[90m\"{quote}\"\033[0m")
+    print(f"    Running on: \033[36m{hw_label}\033[0m | Model: {MODEL_NAME} | CWD: {CWD}")
+    if achievements_count > 0:
+        print(f"    Achievements: {achievements_count}/{total_achievements} unlocked")
+    print(f"    Type /help for commands, /about for the manifesto.\n")
 
 
 def main():
@@ -1471,6 +1660,11 @@ def main():
 
     _setup_readline_history()
     _setup_tab_completion()
+
+    # Track session for achievements
+    ACHIEVEMENTS["stats"]["sessions"] = ACHIEVEMENTS["stats"].get("sessions", 0) + 1
+    _save_achievements(ACHIEVEMENTS)
+
     banner()
 
     # Backend Detection
