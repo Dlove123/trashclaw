@@ -38,19 +38,40 @@ else:
     import readline
 
 # ── Config ──
-VERSION = "0.3.0"
-LLAMA_URL = os.environ.get("TRASHCLAW_URL", "http://localhost:8080")
-MODEL_NAME = os.environ.get("TRASHCLAW_MODEL", "local")
-MAX_TOOL_ROUNDS = int(os.environ.get("TRASHCLAW_MAX_ROUNDS", "15"))
+VERSION = "0.3.1"
+CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".trashclaw")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+HISTORY_FILE = os.path.join(CONFIG_DIR, "history")
+
+def _load_config() -> Dict:
+    """Load config from ~/.trashclaw/config.json, merged with env vars (env wins)."""
+    cfg = {}
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                cfg = json.load(f)
+        except Exception:
+            pass
+    return cfg
+
+_CFG = _load_config()
+
+def _c(key: str, env_key: str, default: str) -> str:
+    """Config lookup: env var > config file > default."""
+    return os.environ.get(env_key, _CFG.get(key, default))
+
+LLAMA_URL = _c("url", "TRASHCLAW_URL", "http://localhost:8080")
+MODEL_NAME = _c("model", "TRASHCLAW_MODEL", "local")
+MAX_TOOL_ROUNDS = int(_c("max_rounds", "TRASHCLAW_MAX_ROUNDS", "15"))
 MAX_OUTPUT_CHARS = 8000
-MAX_CONTEXT_MESSAGES = int(os.environ.get("TRASHCLAW_MAX_CONTEXT", "80"))
-AUTO_COMPACT_THRESHOLD = MAX_CONTEXT_MESSAGES + 20  # auto-compact when exceeded
+MAX_CONTEXT_MESSAGES = int(_c("max_context", "TRASHCLAW_MAX_CONTEXT", "80"))
+AUTO_COMPACT_THRESHOLD = MAX_CONTEXT_MESSAGES + 20
 LLM_RETRY_ATTEMPTS = 2
-LLM_RETRY_DELAY = 3  # seconds
-APPROVE_SHELL = os.environ.get("TRASHCLAW_AUTO_SHELL", "0") != "1"
+LLM_RETRY_DELAY = 3
+APPROVE_SHELL = _c("auto_shell", "TRASHCLAW_AUTO_SHELL", "0") != "1"
 HISTORY: List[Dict] = []
+UNDO_STACK: List[Dict] = []  # [{path, content_before, action}]
 CWD = os.getcwd()
-HISTORY_FILE = os.path.join(os.path.expanduser("~"), ".trashclaw", "history")
 
 # ── Tool Definitions ──
 
@@ -288,6 +309,63 @@ def _auto_compact():
         print(f"  \033[90m[auto-compact] {old_len} → {len(HISTORY)} messages\033[0m")
 
 
+def _load_project_instructions() -> str:
+    """Load project-specific instructions from .trashclaw.md or CLAUDE.md in CWD."""
+    for name in (".trashclaw.md", "TRASHCLAW.md", "CLAUDE.md"):
+        path = os.path.join(CWD, name)
+        if os.path.exists(path):
+            try:
+                with open(path, "r") as f:
+                    content = f.read(4000)  # Cap at 4K to not blow context
+                return f"\n\n--- Project Instructions (from {name}) ---\n{content}"
+            except Exception:
+                pass
+    return ""
+
+
+SLASH_COMMANDS = ["/cd", "/clear", "/compact", "/status", "/save", "/load",
+                  "/sessions", "/undo", "/config", "/exit", "/quit", "/help"]
+
+
+def _setup_tab_completion():
+    """Set up tab completion for slash commands and file paths."""
+    def completer(text, state):
+        if text.startswith("/"):
+            matches = [c for c in SLASH_COMMANDS if c.startswith(text)]
+        else:
+            # File path completion
+            if text:
+                expanded = os.path.expanduser(text)
+                if not os.path.isabs(expanded):
+                    expanded = os.path.join(CWD, expanded)
+                dir_part = os.path.dirname(expanded)
+                base_part = os.path.basename(expanded)
+            else:
+                dir_part = CWD
+                base_part = ""
+            try:
+                entries = os.listdir(dir_part) if os.path.isdir(dir_part) else []
+                matches = [os.path.join(os.path.dirname(text) if text else "", e)
+                          for e in entries if e.startswith(base_part)]
+            except Exception:
+                matches = []
+        return matches[state] if state < len(matches) else None
+
+    try:
+        if hasattr(readline, 'set_completer'):
+            readline.set_completer(completer)
+        if hasattr(readline, 'parse_and_bind'):
+            # macOS uses libedit which needs different binding
+            if "libedit" in getattr(readline, '__doc__', '') or '':
+                readline.parse_and_bind("bind ^I rl_complete")
+            else:
+                readline.parse_and_bind("tab: complete")
+        if hasattr(readline, 'set_completer_delims'):
+            readline.set_completer_delims(' \t\n')
+    except Exception:
+        pass
+
+
 def tool_read_file(path: str, offset: int = None, limit: int = None) -> str:
     path = _resolve_path(path)
     try:
@@ -314,10 +392,26 @@ def tool_read_file(path: str, offset: int = None, limit: int = None) -> str:
     return result
 
 
+def _save_undo(path: str, action: str):
+    """Save file state before modification for undo."""
+    try:
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                UNDO_STACK.append({"path": path, "content": f.read(), "action": action})
+        else:
+            UNDO_STACK.append({"path": path, "content": None, "action": action})
+        # Keep stack bounded
+        if len(UNDO_STACK) > 50:
+            UNDO_STACK[:] = UNDO_STACK[-50:]
+    except Exception:
+        pass
+
+
 def tool_write_file(path: str, content: str) -> str:
     path = _resolve_path(path)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        _save_undo(path, "write")
         with open(path, "w") as f:
             f.write(content)
         lines = content.count("\n") + 1
@@ -352,6 +446,7 @@ def tool_edit_file(path: str, old_string: str, new_string: str) -> str:
 
     new_content = content.replace(old_string, new_string, 1)
     try:
+        _save_undo(path, "edit")
         with open(path, "w") as f:
             f.write(new_content)
     except Exception as e:
@@ -709,7 +804,7 @@ IMPORTANT RULES:
 7. Use run_command freely — curl for web requests, python for computation, etc.
 8. Chain tools together to accomplish complex tasks autonomously.
 
-You are part of the Elyan Labs ecosystem. Current directory: {cwd}"""
+You are part of the Elyan Labs ecosystem. Current directory: {cwd}{project_instructions}"""
 
 
 def llm_request_with_retry(messages: List[Dict], tools: List[Dict] = None) -> Dict:
@@ -878,7 +973,10 @@ def agent_turn(user_message: str):
 
     for round_num in range(MAX_TOOL_ROUNDS):
         # Build messages
-        sys_prompt = SYSTEM_PROMPT.format(cwd=CWD, project_context=detect_project_context())
+        sys_prompt = SYSTEM_PROMPT.format(
+            cwd=CWD, project_context=detect_project_context(),
+            project_instructions=_load_project_instructions()
+        )
         messages = [{"role": "system", "content": sys_prompt}]
         # Keep recent context within bounds
         messages.extend(HISTORY[-MAX_CONTEXT_MESSAGES:])
@@ -1110,6 +1208,72 @@ def handle_slash(cmd: str) -> bool:
                     except:
                         print(f"    - {name} (unreadable)")
 
+    elif command == "/undo":
+        if not UNDO_STACK:
+            print("  Nothing to undo.")
+        else:
+            entry = UNDO_STACK.pop()
+            path = entry["path"]
+            if entry["content"] is None:
+                # File didn't exist before — remove it
+                try:
+                    os.remove(path)
+                    print(f"  Undid {entry['action']}: removed {path}")
+                except Exception as e:
+                    print(f"  Undo failed: {e}")
+            else:
+                try:
+                    with open(path, "w") as f:
+                        f.write(entry["content"])
+                    print(f"  Undid {entry['action']}: restored {path}")
+                except Exception as e:
+                    print(f"  Undo failed: {e}")
+
+    elif command == "/config":
+        if not arg:
+            # Show current config
+            print(f"  \033[1mConfig\033[0m ({CONFIG_FILE})")
+            if os.path.exists(CONFIG_FILE):
+                try:
+                    with open(CONFIG_FILE, 'r') as f:
+                        cfg = json.load(f)
+                    for k, v in cfg.items():
+                        print(f"    {k}: {v}")
+                except Exception:
+                    print("    (error reading config)")
+            else:
+                print("    (no config file — using defaults)")
+            print(f"\n  \033[1mActive Values\033[0m")
+            print(f"    url: {LLAMA_URL}")
+            print(f"    model: {MODEL_NAME}")
+            print(f"    max_rounds: {MAX_TOOL_ROUNDS}")
+            print(f"    max_context: {MAX_CONTEXT_MESSAGES}")
+            print(f"    auto_shell: {'1' if not APPROVE_SHELL else '0'}")
+        else:
+            # Set a config value: /config key value
+            parts_cfg = arg.split(None, 1)
+            if len(parts_cfg) < 2:
+                print("  Usage: /config <key> <value>")
+                print("  Keys: url, model, max_rounds, max_context, auto_shell")
+            else:
+                key, val = parts_cfg
+                os.makedirs(CONFIG_DIR, exist_ok=True)
+                cfg = {}
+                if os.path.exists(CONFIG_FILE):
+                    try:
+                        with open(CONFIG_FILE, 'r') as f:
+                            cfg = json.load(f)
+                    except Exception:
+                        pass
+                cfg[key] = val
+                try:
+                    with open(CONFIG_FILE, 'w') as f:
+                        json.dump(cfg, f, indent=2)
+                    print(f"  Saved: {key} = {val}")
+                    print(f"  Restart TrashClaw for changes to take effect.")
+                except Exception as e:
+                    print(f"  Error saving config: {e}")
+
     elif command == "/help":
         print("""
   \033[1mTrashClaw v{ver} — Commands\033[0m
@@ -1121,6 +1285,8 @@ def handle_slash(cmd: str) -> bool:
   /save <name>   Save conversation to session file
   /load <name>   Load conversation from session file
   /sessions      List saved sessions
+  /undo          Undo last file write or edit
+  /config        Show config (or /config key value to set)
   /exit          Exit TrashClaw
   /help          Show this help
 
@@ -1139,10 +1305,13 @@ def handle_slash(cmd: str) -> bool:
   TRASHCLAW_AUTO_SHELL  Set to 1 to skip shell approval
 
   \033[1mFeatures\033[0m
+  Tab completion for slash commands and file paths.
   Arrow-up recalls previous prompts (persisted across sessions).
   Pipe input: echo "fix the bug" | python3 trashclaw.py
   Auto-compacts context when conversation gets too long.
   Git branch shown in prompt when in a repo.
+  /undo rolls back file writes and edits.
+  .trashclaw.md in project root = custom instructions for agent.
 
   Just type naturally. TrashClaw will use tools autonomously.
         """.replace("{ver}", VERSION))
@@ -1207,6 +1376,7 @@ def main():
         return
 
     _setup_readline_history()
+    _setup_tab_completion()
     banner()
 
     # Backend Detection
