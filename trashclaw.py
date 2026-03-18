@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-TrashClaw v0.2 — Local Tool-Use Agent
+TrashClaw v0.3 — Local Tool-Use Agent
 ======================================
 A general-purpose agent powered by a local LLM. Reads files, writes files,
-runs commands, searches codebases, fetches URLs, processes data — whatever
-you need. OpenClaw-style tool-use loop with zero external dependencies.
+runs commands, searches codebases, manages git — whatever you need.
+OpenClaw-style tool-use loop with zero external dependencies.
 
-Pure Python stdlib. Python 3.7+. Works with any OpenAI-compatible server.
+Pure Python stdlib. Python 3.7+. Works with llama.cpp, Ollama, LM Studio,
+or any OpenAI-compatible server.
 """
 
 import os
@@ -19,6 +20,7 @@ import re
 import glob as globlib
 import difflib
 import traceback
+import time
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -36,13 +38,19 @@ else:
     import readline
 
 # ── Config ──
+VERSION = "0.3.0"
 LLAMA_URL = os.environ.get("TRASHCLAW_URL", "http://localhost:8080")
 MODEL_NAME = os.environ.get("TRASHCLAW_MODEL", "local")
 MAX_TOOL_ROUNDS = int(os.environ.get("TRASHCLAW_MAX_ROUNDS", "15"))
 MAX_OUTPUT_CHARS = 8000
+MAX_CONTEXT_MESSAGES = int(os.environ.get("TRASHCLAW_MAX_CONTEXT", "80"))
+AUTO_COMPACT_THRESHOLD = MAX_CONTEXT_MESSAGES + 20  # auto-compact when exceeded
+LLM_RETRY_ATTEMPTS = 2
+LLM_RETRY_DELAY = 3  # seconds
 APPROVE_SHELL = os.environ.get("TRASHCLAW_AUTO_SHELL", "0") != "1"
 HISTORY: List[Dict] = []
 CWD = os.getcwd()
+HISTORY_FILE = os.path.join(os.path.expanduser("~"), ".trashclaw", "history")
 
 # ── Tool Definitions ──
 
@@ -234,6 +242,50 @@ def _resolve_path(path: str) -> str:
     if not os.path.isabs(path):
         path = os.path.join(CWD, path)
     return os.path.normpath(path)
+
+
+def _git_branch() -> str:
+    """Get current git branch name, or empty string if not in a repo."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=CWD, capture_output=True, text=True, timeout=3
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _setup_readline_history():
+    """Load readline history from disk for arrow-up recall across sessions."""
+    os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
+    try:
+        if hasattr(readline, 'read_history_file') and os.path.exists(HISTORY_FILE):
+            readline.read_history_file(HISTORY_FILE)
+        if hasattr(readline, 'set_history_length'):
+            readline.set_history_length(500)
+    except Exception:
+        pass
+
+
+def _save_readline_history():
+    """Save readline history to disk."""
+    try:
+        if hasattr(readline, 'write_history_file'):
+            readline.write_history_file(HISTORY_FILE)
+    except Exception:
+        pass
+
+
+def _auto_compact():
+    """Auto-compact conversation if it exceeds the threshold."""
+    if len(HISTORY) > AUTO_COMPACT_THRESHOLD:
+        keep = MAX_CONTEXT_MESSAGES
+        old_len = len(HISTORY)
+        HISTORY[:] = HISTORY[-keep:]
+        print(f"  \033[90m[auto-compact] {old_len} → {len(HISTORY)} messages\033[0m")
 
 
 def tool_read_file(path: str, offset: int = None, limit: int = None) -> str:
@@ -638,10 +690,13 @@ You have access to these tools:
 - read_file: Read file contents with optional line range
 - write_file: Create or overwrite files
 - edit_file: Replace exact strings in files (must match uniquely)
-- run_command: Execute shell commands (curl, git, grep, python, anything installed)
+- run_command: Execute shell commands (curl, grep, python, anything installed)
 - search_files: Grep for patterns across files
 - find_files: Find files by glob pattern
 - list_dir: List directory contents
+- git_status: Show modified, staged, and untracked files
+- git_diff: Show unstaged or staged changes
+- git_commit: Stage all changes and commit
 - think: Reason through a problem step by step before acting
 
 IMPORTANT RULES:
@@ -655,6 +710,21 @@ IMPORTANT RULES:
 8. Chain tools together to accomplish complex tasks autonomously.
 
 You are part of the Elyan Labs ecosystem. Current directory: {cwd}"""
+
+
+def llm_request_with_retry(messages: List[Dict], tools: List[Dict] = None) -> Dict:
+    """Call llm_request with retry on connection failure."""
+    for attempt in range(LLM_RETRY_ATTEMPTS + 1):
+        result = llm_request(messages, tools)
+        if "error" not in result or attempt >= LLM_RETRY_ATTEMPTS:
+            return result
+        err = result["error"]
+        if "Cannot reach" in err or "timed out" in err or "Connection refused" in err:
+            print(f"  \033[33m[retry {attempt + 1}/{LLM_RETRY_ATTEMPTS}]\033[0m {err}")
+            time.sleep(LLM_RETRY_DELAY)
+        else:
+            return result  # non-retryable error
+    return result
 
 
 def llm_request(messages: List[Dict], tools: List[Dict] = None) -> Dict:
@@ -804,20 +874,21 @@ def _try_parse_tool_calls_from_text(text: str) -> Optional[List[Dict]]:
 def agent_turn(user_message: str):
     """Run the full agent loop: LLM thinks, calls tools, observes, repeats."""
     HISTORY.append({"role": "user", "content": user_message})
+    _auto_compact()
 
     for round_num in range(MAX_TOOL_ROUNDS):
         # Build messages
         sys_prompt = SYSTEM_PROMPT.format(cwd=CWD, project_context=detect_project_context())
         messages = [{"role": "system", "content": sys_prompt}]
-        # Keep recent context
-        messages.extend(HISTORY[-40:])
+        # Keep recent context within bounds
+        messages.extend(HISTORY[-MAX_CONTEXT_MESSAGES:])
 
         # Show thinking indicator
         indicator = f"  \033[90m[round {round_num + 1}]\033[0m " if round_num > 0 else "  "
         print(f"{indicator}\033[90mthinking...\033[0m", end="", flush=True)
 
-        # Call LLM
-        response = llm_request(messages, tools=TOOLS)
+        # Call LLM (with retry on connection failure)
+        response = llm_request_with_retry(messages, tools=TOOLS)
 
         # Clear thinking indicator
         print(f"\r{' ' * 60}\r", end="")
@@ -898,6 +969,13 @@ def agent_turn(user_message: str):
                 print(f"  \033[34m[ls]\033[0m {args.get('path', CWD)}")
             elif tool_name == "fetch_url":
                 print(f"  \033[34m[fetch]\033[0m {args.get('url', '?')}")
+            elif tool_name == "git_status":
+                print(f"  \033[35m[git]\033[0m status")
+            elif tool_name == "git_diff":
+                staged = "staged" if args.get("staged") else "unstaged"
+                print(f"  \033[35m[git]\033[0m diff ({staged})")
+            elif tool_name == "git_commit":
+                print(f"  \033[35m[git]\033[0m commit: {args.get('message', '?')[:60]}")
 
             # Execute
             handler = TOOL_DISPATCH.get(tool_name)
@@ -1034,26 +1112,40 @@ def handle_slash(cmd: str) -> bool:
 
     elif command == "/help":
         print("""
-  \033[1mTrashClaw Agent Commands\033[0m
+  \033[1mTrashClaw v{ver} — Commands\033[0m
 
   /cd <dir>      Change working directory
   /clear         Clear all conversation context
-  /compact       Keep only last 10 messages (saves context)
+  /compact       Keep only last 10 messages
   /status        Show server, model, and context info
-  /save <name>   Save current conversation to session file
+  /save <name>   Save conversation to session file
   /load <name>   Load conversation from session file
-  /sessions      List all saved sessions
+  /sessions      List saved sessions
   /exit          Exit TrashClaw
   /help          Show this help
 
-  \033[1mEnvironment Variables\033[0m
-  TRASHCLAW_URL        llama-server endpoint (default: http://localhost:8080)
-  TRASHCLAW_MODEL      Model name for display
-  TRASHCLAW_MAX_ROUNDS Max tool execution rounds (default: 15)
-  TRASHCLAW_AUTO_SHELL Set to 1 to skip shell command approval
+  \033[1mCLI Flags\033[0m
+  --cwd <dir>    Set working directory
+  --url <url>    Set LLM server URL
+  --auto-shell   Skip shell command approval
+  -e, --exec "prompt"  Run one prompt and exit (non-interactive)
+  --version      Show version
 
-  Just type naturally. TrashClaw will use tools autonomously to help you.
-        """)
+  \033[1mEnvironment Variables\033[0m
+  TRASHCLAW_URL         LLM endpoint (default: http://localhost:8080)
+  TRASHCLAW_MODEL       Model name for display
+  TRASHCLAW_MAX_ROUNDS  Max tool rounds per turn (default: 15)
+  TRASHCLAW_MAX_CONTEXT Max conversation messages (default: 80)
+  TRASHCLAW_AUTO_SHELL  Set to 1 to skip shell approval
+
+  \033[1mFeatures\033[0m
+  Arrow-up recalls previous prompts (persisted across sessions).
+  Pipe input: echo "fix the bug" | python3 trashclaw.py
+  Auto-compacts context when conversation gets too long.
+  Git branch shown in prompt when in a repo.
+
+  Just type naturally. TrashClaw will use tools autonomously.
+        """.replace("{ver}", VERSION))
     else:
         print(f"  Unknown command: {command}. Try /help")
 
@@ -1071,29 +1163,50 @@ def banner():
     ██║   ██║  ██║██║  ██║███████║██║  ██║╚██████╗███████╗██║  ██║╚███╔███╔╝
     ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝ ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝\033[0m
 
-    \033[1mElyan Labs\033[0m | Mac Pro Trashcan Edition | v0.2
-    General-purpose agent — files, commands, search, automation, anything local.
+    \033[1mElyan Labs\033[0m | Mac Pro Trashcan Edition | v{version}
+    General-purpose agent — files, commands, git, search, automation.
     Model: {model} | CWD: {cwd}
     Type /help for commands, or just describe what you want to do.
-""".format(model=MODEL_NAME, cwd=CWD))
+""".format(model=MODEL_NAME, cwd=CWD, version=VERSION))
 
 
 def main():
     global CWD
 
-    # Parse --cwd argument
-    for i, arg in enumerate(sys.argv[1:], 1):
-        if arg == "--cwd" and i < len(sys.argv):
-            CWD = os.path.abspath(sys.argv[i + 1])
-        elif arg.startswith("--cwd="):
-            CWD = os.path.abspath(arg.split("=", 1)[1])
-        elif arg == "--url" and i < len(sys.argv):
-            globals()["LLAMA_URL"] = sys.argv[i + 1]
-        elif arg.startswith("--url="):
-            globals()["LLAMA_URL"] = arg.split("=", 1)[1]
-        elif arg == "--auto-shell":
-            globals()["APPROVE_SHELL"] = False
+    # Parse arguments
+    one_shot = None
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        if args[i] == "--cwd" and i + 1 < len(args):
+            CWD = os.path.abspath(args[i + 1]); i += 2
+        elif args[i].startswith("--cwd="):
+            CWD = os.path.abspath(args[i].split("=", 1)[1]); i += 1
+        elif args[i] == "--url" and i + 1 < len(args):
+            globals()["LLAMA_URL"] = args[i + 1]; i += 2
+        elif args[i].startswith("--url="):
+            globals()["LLAMA_URL"] = args[i].split("=", 1)[1]; i += 1
+        elif args[i] == "--auto-shell":
+            globals()["APPROVE_SHELL"] = False; i += 1
+        elif args[i] in ("-e", "--exec") and i + 1 < len(args):
+            one_shot = args[i + 1]; i += 2
+        elif args[i] == "--version":
+            print(f"TrashClaw v{VERSION}"); sys.exit(0)
+        else:
+            i += 1
 
+    # Non-interactive: pipe or --exec mode
+    if one_shot:
+        agent_turn(one_shot)
+        return
+    if not sys.stdin.isatty():
+        # Piped input: read all of stdin as a single prompt
+        piped = sys.stdin.read().strip()
+        if piped:
+            agent_turn(piped)
+        return
+
+    _setup_readline_history()
     banner()
 
     # Backend Detection
@@ -1143,22 +1256,27 @@ def main():
     else:
         print(f"  \033[32mConnected to {backend} at {LLAMA_URL}\033[0m\n")
 
-    while True:
-        try:
-            prompt = f"\033[1mtrashclaw\033[0m \033[90m{os.path.basename(CWD)}\033[0m> "
-            user_input = input(prompt).strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nTrashClaw out.")
-            break
+    try:
+        while True:
+            try:
+                branch = _git_branch()
+                branch_str = f" \033[33m({branch})\033[0m" if branch else ""
+                prompt = f"\033[1mtrashclaw\033[0m \033[90m{os.path.basename(CWD)}\033[0m{branch_str}> "
+                user_input = input(prompt).strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nTrashClaw out.")
+                break
 
-        if not user_input:
-            continue
+            if not user_input:
+                continue
 
-        if user_input.startswith("/"):
-            handle_slash(user_input)
-            continue
+            if user_input.startswith("/"):
+                handle_slash(user_input)
+                continue
 
-        agent_turn(user_input)
+            agent_turn(user_input)
+    finally:
+        _save_readline_history()
 
 
 if __name__ == "__main__":
