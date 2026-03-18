@@ -21,6 +21,7 @@ import glob as globlib
 import difflib
 import traceback
 import time
+import signal
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -38,7 +39,7 @@ else:
     import readline
 
 # ── Config ──
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".trashclaw")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 HISTORY_FILE = os.path.join(CONFIG_DIR, "history")
@@ -71,7 +72,10 @@ LLM_RETRY_DELAY = 3
 APPROVE_SHELL = _c("auto_shell", "TRASHCLAW_AUTO_SHELL", "0") != "1"
 HISTORY: List[Dict] = []
 UNDO_STACK: List[Dict] = []  # [{path, content_before, action}]
+APPROVED_COMMANDS: set = set()  # command prefixes user has approved (e.g. "python3", "npm")
+EXTRA_SYSTEM_PROMPT: str = ""  # injected via --system flag
 CWD = os.getcwd()
+_INTERRUPTED = False
 
 # ── Tool Definitions ──
 
@@ -300,6 +304,19 @@ def _save_readline_history():
         pass
 
 
+def _sigint_handler(sig, frame):
+    """Handle Ctrl+C during generation — set flag instead of killing."""
+    global _INTERRUPTED
+    _INTERRUPTED = True
+    print("\n  \033[33m[interrupted]\033[0m")
+
+
+def _estimate_tokens(messages: List[Dict]) -> int:
+    """Rough token estimate: ~4 chars per token for English text."""
+    total_chars = sum(len(m.get("content", "") or "") for m in messages)
+    return total_chars // 4
+
+
 def _auto_compact():
     """Auto-compact conversation if it exceeds the threshold."""
     if len(HISTORY) > AUTO_COMPACT_THRESHOLD:
@@ -324,7 +341,8 @@ def _load_project_instructions() -> str:
 
 
 SLASH_COMMANDS = ["/cd", "/clear", "/compact", "/status", "/save", "/load",
-                  "/sessions", "/undo", "/config", "/exit", "/quit", "/help"]
+                  "/sessions", "/model", "/export", "/undo", "/config",
+                  "/exit", "/quit", "/help"]
 
 
 def _setup_tab_completion():
@@ -452,23 +470,40 @@ def tool_edit_file(path: str, old_string: str, new_string: str) -> str:
     except Exception as e:
         return f"Error writing {path}: {e}"
 
-    # Show diff
+    # Show colored diff
     old_lines = old_string.split("\n")
     new_lines = new_string.split("\n")
     diff = list(difflib.unified_diff(old_lines, new_lines, lineterm="", n=2))
-    diff_str = "\n".join(diff[:20]) if diff else "(no visible diff)"
+    if diff:
+        colored_lines = []
+        for line in diff[:20]:
+            if line.startswith("+") and not line.startswith("+++"):
+                colored_lines.append(f"\033[32m{line}\033[0m")
+            elif line.startswith("-") and not line.startswith("---"):
+                colored_lines.append(f"\033[31m{line}\033[0m")
+            else:
+                colored_lines.append(line)
+        diff_str = "\n".join(colored_lines)
+    else:
+        diff_str = "(no visible diff)"
     return f"Edited {path} (1 replacement)\n{diff_str}"
 
 
 def tool_run_command(command: str, timeout: int = 30) -> str:
     global CWD
     if APPROVE_SHELL:
-        try:
-            answer = input(f"  \033[33mRun:\033[0m {command} \033[90m[y/N]\033[0m ").strip().lower()
-        except EOFError:
-            return "Error: User denied command (EOF)"
-        if answer not in ("y", "yes"):
-            return "Command cancelled by user."
+        # Check if command prefix is pre-approved
+        cmd_prefix = command.strip().split()[0] if command.strip() else ""
+        if cmd_prefix not in APPROVED_COMMANDS:
+            try:
+                answer = input(f"  \033[33mRun:\033[0m {command} \033[90m[y/N/a(lways)]\033[0m ").strip().lower()
+            except EOFError:
+                return "Error: User denied command (EOF)"
+            if answer in ("a", "always"):
+                APPROVED_COMMANDS.add(cmd_prefix)
+                print(f"  \033[90m[approved: {cmd_prefix} commands for this session]\033[0m")
+            elif answer not in ("y", "yes"):
+                return "Command cancelled by user."
 
     # Handle cd specially
     if command.strip().startswith("cd "):
@@ -848,6 +883,8 @@ def llm_request(messages: List[Dict], tools: List[Dict] = None) -> Dict:
     try:
         with urllib.request.urlopen(req, timeout=180) as resp:
             for line in resp:
+                if _INTERRUPTED:
+                    break
                 line = line.decode("utf-8").strip()
                 if not line or not line.startswith("data: "):
                     continue
@@ -968,15 +1005,33 @@ def _try_parse_tool_calls_from_text(text: str) -> Optional[List[Dict]]:
 
 def agent_turn(user_message: str):
     """Run the full agent loop: LLM thinks, calls tools, observes, repeats."""
+    global _INTERRUPTED
+    _INTERRUPTED = False
     HISTORY.append({"role": "user", "content": user_message})
     _auto_compact()
 
-    for round_num in range(MAX_TOOL_ROUNDS):
+    # Ctrl+C during generation stops the turn, not the app
+    old_handler = signal.signal(signal.SIGINT, _sigint_handler)
+    try:
+        _agent_loop(round_limit=MAX_TOOL_ROUNDS)
+    finally:
+        signal.signal(signal.SIGINT, old_handler)
+
+
+def _agent_loop(round_limit: int):
+    """Inner agent loop, separated for clean signal handling."""
+    global _INTERRUPTED
+    for round_num in range(round_limit):
+        if _INTERRUPTED:
+            HISTORY.append({"role": "assistant", "content": "[interrupted by user]"})
+            return
         # Build messages
         sys_prompt = SYSTEM_PROMPT.format(
             cwd=CWD, project_context=detect_project_context(),
             project_instructions=_load_project_instructions()
         )
+        if EXTRA_SYSTEM_PROMPT:
+            sys_prompt += f"\n\n--- Custom Instructions ---\n{EXTRA_SYSTEM_PROMPT}"
         messages = [{"role": "system", "content": sys_prompt}]
         # Keep recent context within bounds
         messages.extend(HISTORY[-MAX_CONTEXT_MESSAGES:])
@@ -1131,13 +1186,19 @@ def handle_slash(cmd: str) -> bool:
             status = health.get("status", "unknown")
         except Exception:
             status = "unreachable"
+        branch = _git_branch()
+        est_tokens = _estimate_tokens(HISTORY)
         print(f"  Server: {status} ({LLAMA_URL})")
         print(f"  Model: {MODEL_NAME}")
-        print(f"  Context: {len(HISTORY)} messages")
+        print(f"  Context: {len(HISTORY)} messages (~{est_tokens} tokens)")
         print(f"  CWD: {CWD}")
+        if branch:
+            print(f"  Branch: {branch}")
         print(f"  Project: {detect_project_context()}")
-        print(f"  Max rounds: {MAX_TOOL_ROUNDS}")
-        print(f"  Shell approval: {'on' if APPROVE_SHELL else 'off'}")
+        print(f"  Tools: {len(TOOLS)} | Undo stack: {len(UNDO_STACK)}")
+        print(f"  Max rounds: {MAX_TOOL_ROUNDS} | Shell approval: {'on' if APPROVE_SHELL else 'off'}")
+        if APPROVED_COMMANDS:
+            print(f"  Auto-approved: {', '.join(sorted(APPROVED_COMMANDS))}")
 
     elif command == "/compact":
         # Keep only last 10 messages
@@ -1207,6 +1268,34 @@ def handle_slash(cmd: str) -> bool:
                         print(f"    - {name} ({msg_count} messages, saved {saved_at})")
                     except:
                         print(f"    - {name} (unreadable)")
+
+    elif command == "/model":
+        if not arg:
+            print(f"  Current model: {MODEL_NAME}")
+            print(f"  Usage: /model <name>  (e.g. /model llama3, /model codestral)")
+        else:
+            globals()["MODEL_NAME"] = arg
+            print(f"  Model set to: {arg}")
+
+    elif command == "/export":
+        # Export conversation as markdown
+        export_name = arg or f"trashclaw_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        export_path = os.path.join(CWD, f"{export_name}.md")
+        try:
+            with open(export_path, 'w', encoding='utf-8') as f:
+                f.write(f"# TrashClaw Conversation — {datetime.now().isoformat()[:19]}\n\n")
+                for msg in HISTORY:
+                    role = msg.get("role", "unknown")
+                    content = msg.get("content", "") or ""
+                    if role == "user":
+                        f.write(f"## User\n\n{content}\n\n")
+                    elif role == "assistant":
+                        f.write(f"## Assistant\n\n{content}\n\n")
+                    elif role == "tool":
+                        f.write(f"### Tool Result\n\n```\n{content[:2000]}\n```\n\n")
+            print(f"  Exported to {export_path}")
+        except Exception as e:
+            print(f"  Export failed: {e}")
 
     elif command == "/undo":
         if not UNDO_STACK:
@@ -1285,6 +1374,8 @@ def handle_slash(cmd: str) -> bool:
   /save <name>   Save conversation to session file
   /load <name>   Load conversation from session file
   /sessions      List saved sessions
+  /model <name>  Switch model mid-session (for Ollama/multi-model)
+  /export [name] Export conversation as markdown file
   /undo          Undo last file write or edit
   /config        Show config (or /config key value to set)
   /exit          Exit TrashClaw
@@ -1295,6 +1386,7 @@ def handle_slash(cmd: str) -> bool:
   --url <url>    Set LLM server URL
   --auto-shell   Skip shell command approval
   -e, --exec "prompt"  Run one prompt and exit (non-interactive)
+  --system "text" Inject custom instructions into system prompt
   --version      Show version
 
   \033[1mEnvironment Variables\033[0m
@@ -1359,6 +1451,8 @@ def main():
             globals()["APPROVE_SHELL"] = False; i += 1
         elif args[i] in ("-e", "--exec") and i + 1 < len(args):
             one_shot = args[i + 1]; i += 2
+        elif args[i] == "--system" and i + 1 < len(args):
+            globals()["EXTRA_SYSTEM_PROMPT"] = args[i + 1]; i += 2
         elif args[i] == "--version":
             print(f"TrashClaw v{VERSION}"); sys.exit(0)
         else:
