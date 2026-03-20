@@ -88,3 +88,24 @@ trashclaw/
 ## License
 
 By contributing, you agree that your contributions will be licensed under the MIT License.
+
+---
+
+## Quick Fixes (Easy Bounties)
+
+Look for:
+- Typos in README.md or docs/
+- Grammar improvements  
+- Missing documentation
+- Unclear error messages
+
+Each valid fix earns **1 RTC**. Multiple fixes welcome!
+
+## How to Submit
+
+1. Fork the repo
+2. Create a branch: `git checkout -b fix/typo-xxx`
+3. Make your change
+4. Commit: `git commit -m "Fix typo in README"`
+5. Push and open a PR
+6. Add your wallet address in the PR description
