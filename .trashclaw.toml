@@ -1,0 +1,73 @@
+# TrashClaw Configuration File
+# https://github.com/Scottcjn/trashclaw
+
+[agent]
+name = "TrashClaw"
+version = "1.0.0"
+description = "A general-purpose local agent that runs on anything"
+
+[server]
+# llama-server endpoint (default: local)
+host = "localhost"
+port = 8080
+timeout = 300  # 5 minutes
+
+[model]
+# Model configuration
+context_length = 8192
+temperature = 0.7
+max_tokens = 4096
+
+[tools]
+# Enable/disable built-in tools
+file_tools = true
+shell_tools = true
+web_tools = true
+data_tools = true
+system_tools = true
+
+# Custom tools directory
+custom_tools_dir = "./tools"
+
+[context]
+# Auto-loaded context files
+auto_load = true
+context_files = [
+    "./.trashclaw/context/project.md",
+    "./.trashclaw/context/notes.md",
+    "./.trashclaw/context/preferences.md"
+]
+
+# Context file format
+format = "markdown"
+
+[ui]
+# User interface preferences
+theme = "dark"
+show_thoughts = true
+show_tool_calls = true
+confirm_commands = true  # Ask before running shell commands
+
+[logging]
+# Logging configuration
+level = "info"  # debug, info, warning, error
+file = "./trashclaw.log"
+max_size = "10MB"
+backup_count = 5
+
+[security]
+# Security settings
+allowed_directories = [
+    "~/projects",
+    "~/documents",
+    "/tmp"
+]
+blocked_commands = [
+    "rm -rf /",
+    "mkfs",
+    "dd if=/dev/zero"
+]
+require_confirmation_for = [
+    "shell",
+    "web_request"
+]
