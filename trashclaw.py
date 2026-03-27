@@ -181,6 +181,35 @@ TOOLS = [
                 "required": ["thought"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "view_image",
+            "description": "Read an image file and return it as base64-encoded data for vision models. Supports PNG, JPG, GIF, WebP.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Image file path to read"},
+                    "resize_max": {"type": "integer", "description": "Max dimension for resizing (optional, reduces token usage)"}
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "take_screenshot",
+            "description": "Take a screenshot and return as base64-encoded image. Uses system screenshot tools (scrot/import/screencapture).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "region": {"type": "string", "description": "Screen region 'WIDTHxHEIGHT+X+Y' (optional, default: full screen)"}
+                },
+                "required": []
+            }
+        }
     }
 ]
 
@@ -467,6 +496,97 @@ def tool_think(thought: str) -> str:
     return f"[Thought recorded, no side effects]"
 
 
+def tool_view_image(path: str, resize_max: int = None) -> str:
+    """Read an image file and return as base64-encoded data for vision models."""
+    import base64
+    
+    path = _resolve_path(path)
+    
+    if not os.path.exists(path):
+        return f"Error: Image file not found: {path}"
+    
+    valid_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'}
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in valid_extensions:
+        return f"Error: Unsupported image format '{ext}'. Supported: {', '.join(valid_extensions)}"
+    
+    mime_types = {
+        '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+        '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp',
+    }
+    mime_type = mime_types.get(ext, 'application/octet-stream')
+    
+    try:
+        with open(path, 'rb') as f:
+            image_data = f.read()
+        
+        size_kb = len(image_data) / 1024
+        if size_kb > 5000:
+            return f"Error: Image too large ({size_kb:.1f}KB). Max 5MB."
+        
+        base64_data = base64.b64encode(image_data).decode('utf-8')
+        data_url = f"data:{mime_type};base64,{base64_data}"
+        
+        return f"Image loaded: {path}\nSize: {size_kb:.1f}KB\nFormat: {mime_type}\nBase64 length: {len(base64_data)} chars\n\nData URL: {data_url[:200]}..."
+    
+    except Exception as e:
+        return f"Error reading image {path}: {e}"
+
+
+def tool_take_screenshot(region: str = None) -> str:
+    """Take a screenshot using system tools and return as base64."""
+    import base64
+    import tempfile
+    import subprocess
+    
+    temp_file = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+    temp_path = temp_file.name
+    temp_file.close()
+    
+    try:
+        if sys.platform == 'linux':
+            cmd = ['scrot', temp_path]
+            if region:
+                cmd = ['scrot', '-a', region, temp_path]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            
+            if result.returncode != 0:
+                cmd = ['import', '-window', 'root', temp_path]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                
+        elif sys.platform == 'darwin':
+            cmd = ['screencapture', '-x', temp_path]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            
+        elif sys.platform == 'win32':
+            return "Error: Windows screenshot not yet implemented. Use view_image instead."
+        else:
+            return f"Error: Unsupported platform: {sys.platform}"
+        
+        if result.returncode != 0:
+            return f"Error taking screenshot: {result.stderr}"
+        
+        with open(temp_path, 'rb') as f:
+            image_data = f.read()
+        
+        base64_data = base64.b64encode(image_data).decode('utf-8')
+        size_kb = len(image_data) / 1024
+        os.unlink(temp_path)
+        
+        data_url = f"data:image/png;base64,{base64_data}"
+        return f"Screenshot captured\nSize: {size_kb:.1f}KB\nFormat: image/png\nBase64 length: {len(base64_data)} chars\n\nData URL: {data_url[:200]}..."
+    
+    except subprocess.TimeoutExpired:
+        if os.path.exists(temp_path): os.unlink(temp_path)
+        return "Error: Screenshot timed out"
+    except FileNotFoundError as e:
+        if os.path.exists(temp_path): os.unlink(temp_path)
+        return f"Error: Screenshot tool not found. Install 'scrot' (Linux). {e}"
+    except Exception as e:
+        if os.path.exists(temp_path): os.unlink(temp_path)
+        return f"Error taking screenshot: {e}"
+
+
 # Tool dispatch
 TOOL_DISPATCH = {
     "read_file": lambda args: tool_read_file(args["path"], args.get("offset"), args.get("limit")),
@@ -478,6 +598,8 @@ TOOL_DISPATCH = {
     "list_dir": lambda args: tool_list_dir(args.get("path")),
     "fetch_url": lambda args: tool_fetch_url(args["url"]),
     "think": lambda args: tool_think(args["thought"]),
+    "view_image": lambda args: tool_view_image(args["path"], args.get("resize_max")),
+    "take_screenshot": lambda args: tool_take_screenshot(args.get("region")),
 }
 
 
@@ -856,6 +978,37 @@ def handle_slash(cmd: str) -> bool:
         old_len = len(HISTORY)
         HISTORY[:] = HISTORY[-10:]
         print(f"  Compacted {old_len} -> {len(HISTORY)} messages")
+
+    elif command == "/screenshot":
+        # Take a screenshot and show it
+        print("  Taking screenshot...")
+        result = tool_take_screenshot(region=arg if arg else None)
+        print(f"  {result}")
+
+    elif command == "/img":
+        # View an image file
+        if not arg:
+            print("  Usage: /img <image_path>")
+        else:
+            print(f"  Loading image: {arg}")
+            result = tool_view_image(arg)
+            print(f"  {result}")
+
+    elif command == "/vision":
+        # Check if connected LLM supports vision
+        print(f"  Checking vision support at {LLAMA_URL}...")
+        try:
+            req = urllib.request.Request(f"{LLAMA_URL}/v1/models")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                models_data = json.loads(resp.read().decode("utf-8"))
+            models = models_data.get("data", [])
+            vision_models = [m for m in models if any(v in m.get("id", "").lower() for v in ['vision', 'vl', 'llava', 'qwen-vl'])]
+            if vision_models:
+                print(f"  Vision models available: {[m['id'] for m in vision_models]}")
+            else:
+                print(f"  No vision models detected. Models: {[m['id'] for m in models[:5]]}")
+        except Exception as e:
+            print(f"  Could not check vision support: {e}")
 
     elif command == "/save":
         # Save current conversation to JSON file
