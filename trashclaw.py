@@ -44,6 +44,115 @@ APPROVE_SHELL = os.environ.get("TRASHCLAW_AUTO_SHELL", "0") != "1"
 HISTORY: List[Dict] = []
 CWD = os.getcwd()
 
+# ── Project Config (.trashclaw.toml) ──
+PROJECT_CONFIG = {
+    "context_files": [],
+    "system_prompt": "",
+    "model": None,
+    "auto_shell": False,
+}
+
+def load_project_config():
+    """Load .trashclaw.toml or .trashclaw.json from CWD."""
+    import base64
+    
+    toml_path = os.path.join(CWD, ".trashclaw.toml")
+    json_path = os.path.join(CWD, ".trashclaw.json")
+    
+    config_file = None
+    config_data = None
+    
+    # Try TOML first (Python 3.11+ has tomllib, fallback to manual parse)
+    if os.path.exists(toml_path):
+        try:
+            if sys.version_info >= (3, 11):
+                import tomllib
+                with open(toml_path, "rb") as f:
+                    config_data = tomllib.load(f)
+            else:
+                # Simple TOML parser for basic configs (stdlib only)
+                config_data = _parse_simple_toml(toml_path)
+            config_file = toml_path
+        except Exception as e:
+            print(f"Warning: Could not parse {toml_path}: {e}")
+    
+    # Fallback to JSON
+    if config_data is None and os.path.exists(json_path):
+        try:
+            with open(json_path, "r") as f:
+                config_data = json.load(f)
+            config_file = json_path
+        except Exception as e:
+            print(f"Warning: Could not parse {json_path}: {e}")
+    
+    if config_data:
+        # Apply config
+        if "context_files" in config_data:
+            PROJECT_CONFIG["context_files"] = config_data["context_files"]
+        if "system_prompt" in config_data:
+            PROJECT_CONFIG["system_prompt"] = config_data["system_prompt"]
+        if "model" in config_data:
+            PROJECT_CONFIG["model"] = config_data["model"]
+            global MODEL_NAME
+            MODEL_NAME = config_data["model"]
+        if "auto_shell" in config_data:
+            PROJECT_CONFIG["auto_shell"] = config_data["auto_shell"]
+            global APPROVE_SHELL
+            APPROVE_SHELL = not config_data["auto_shell"]
+        
+        print(f"Loaded project config: {config_file}")
+        print(f"  Context files: {PROJECT_CONFIG['context_files']}")
+        print(f"  System prompt: {PROJECT_CONFIG['system_prompt'][:50]}..." if PROJECT_CONFIG['system_prompt'] else "  System prompt: (none)")
+        print(f"  Model: {PROJECT_CONFIG['model'] or MODEL_NAME}")
+        print(f"  Auto shell: {PROJECT_CONFIG['auto_shell']}")
+
+def _parse_simple_toml(path: str) -> dict:
+    """Simple TOML parser for basic configs (stdlib only, Python <3.11)."""
+    result = {}
+    current_section = result
+    
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            
+            # Section header [section]
+            if line.startswith("[") and line.endswith("]"):
+                section_name = line[1:-1]
+                result[section_name] = {}
+                current_section = result[section_name]
+                continue
+            
+            # Key = value
+            if "=" in line:
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                
+                # Parse value type
+                if value.startswith("[") and value.endswith("]"):
+                    # Array
+                    items = value[1:-1].split(",")
+                    current_section[key] = [item.strip().strip('"').strip("'") for item in items if item.strip()]
+                elif value.startswith('"') or value.startswith("'"):
+                    # String
+                    current_section[key] = value.strip('"').strip("'")
+                elif value.lower() in ("true", "false"):
+                    # Boolean
+                    current_section[key] = value.lower() == "true"
+                elif value.isdigit():
+                    # Integer
+                    current_section[key] = int(value)
+                else:
+                    # Float or string
+                    try:
+                        current_section[key] = float(value)
+                    except ValueError:
+                        current_section[key] = value
+    
+    return result
+
 # ── Tool Definitions ──
 
 TOOLS = [
@@ -818,6 +927,11 @@ def agent_turn(user_message: str):
     for round_num in range(MAX_TOOL_ROUNDS):
         # Build messages
         sys_prompt = SYSTEM_PROMPT.format(cwd=CWD, project_context=detect_project_context())
+        
+        # Append project config system prompt if present
+        if PROJECT_CONFIG["system_prompt"]:
+            sys_prompt += f"\n\nAdditional instructions: {PROJECT_CONFIG['system_prompt']}"
+        
         messages = [{"role": "system", "content": sys_prompt}]
         # Keep recent context
         messages.extend(HISTORY[-40:])
@@ -1134,6 +1248,30 @@ def main():
             globals()["LLAMA_URL"] = arg.split("=", 1)[1]
         elif arg == "--auto-shell":
             globals()["APPROVE_SHELL"] = False
+
+    # Load project config (.trashclaw.toml or .trashclaw.json)
+    load_project_config()
+    
+    # Auto-load context files
+    if PROJECT_CONFIG["context_files"]:
+        print(f"\nAuto-loading {len(PROJECT_CONFIG['context_files'])} context file(s)...")
+        for ctx_file in PROJECT_CONFIG["context_files"]:
+            ctx_path = os.path.join(CWD, ctx_file) if not os.path.isabs(ctx_file) else ctx_file
+            if os.path.exists(ctx_path):
+                try:
+                    with open(ctx_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    # Add to history as system context
+                    HISTORY.append({
+                        "role": "system",
+                        "content": f"Project context from {ctx_file}:\n\n{content[:8000]}"
+                    })
+                    print(f"  ✅ Loaded: {ctx_file}")
+                except Exception as e:
+                    print(f"  ⚠️  Could not load {ctx_file}: {e}")
+            else:
+                print(f"  ⚠️  Context file not found: {ctx_file}")
+        print()
 
     banner()
 
