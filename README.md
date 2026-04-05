@@ -37,7 +37,7 @@ It's not a chatbot. It's an agent that does things on your machine.
 ## How it works
 
 1. You describe a task in natural language
-2. The LLM picks from 8 tools: `read_file`, `write_file`, `edit_file`, `run_command`, `search_files`, `find_files`, `list_dir`, `think`
+2. The LLM picks from 10 tools: `read_file`, `write_file`, `edit_file`, `run_command`, `search_files`, `find_files`, `list_dir`, `think`, `view_image`, `fetch_url`
 3. Tools execute locally, results go back to the LLM
 4. Repeat up to 15 rounds until the task is done
 5. Shell commands require your approval (configurable)
@@ -135,7 +135,39 @@ TRASHCLAW_AUTO_SHELL=1 python3 trashclaw.py --cwd ~/myproject
 | `/clear` | Clear context |
 | `/compact` | Trim to last 10 messages |
 | `/status` | Server and context info |
+| `/img <path>` | View an image file (PNG, JPG, GIF, WebP) |
+| `/screenshot` | Take a screenshot (Linux/macOS) |
+| `/vision` | Check if connected LLM supports vision models |
 | `/exit` | Quit |
+
+## Vision Support
+
+TrashClaw supports vision models (Llava, Qwen-VL, etc.) for image understanding:
+
+- **`view_image` tool** — Reads image files and sends as base64-encoded data
+- **`/img <path>` command** — Quick image viewing from the CLI
+- **`/screenshot` command** — Capture screen and analyze with vision model
+- **Auto-detection** — Automatically detects if your LLM supports vision
+- **Graceful fallback** — Works normally even without vision support
+
+```bash
+# View an image file
+trashclaw ~> /img ./diagram.png
+  Image loaded: ./diagram.png
+  Size: 245.3KB
+  Format: image/png
+  
+# Take a screenshot
+trashclaw ~> /screenshot
+  Taking screenshot...
+  Screenshot captured
+  Size: 512.7KB
+  
+# Check vision support
+trashclaw ~> /vision
+  Checking vision support at http://localhost:8080...
+  Vision models available: ['qwen2.5-vl-7b-instruct']
+```
 
 ## Limitations
 
